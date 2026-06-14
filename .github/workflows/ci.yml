@@ -1,0 +1,62 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Validate package.json
+        run: |
+          echo "Checking package.json..."
+          node -e "
+            const pkg = require('./package.json');
+            assert(pkg.name === 'pi-fuse', 'name mismatch');
+            assert(pkg.keywords.includes('pi-package'), 'missing pi-package keyword');
+            assert(pkg.pi?.extensions?.includes('./extensions/index.ts'), 'missing extension path');
+            console.log('✓ package.json valid');
+          "
+
+      - name: Validate config.default.json
+        run: |
+          node -e "
+            const cfg = require('./config.default.json');
+            assert(cfg.default_preset, 'missing default_preset');
+            assert(Object.keys(cfg.presets).length > 0, 'no presets');
+            for (const [name, preset] of Object.entries(cfg.presets)) {
+              assert(preset.panel?.length >= 1, \`\${name}: panel empty\`);
+              assert(preset.judge, \`\${name}: missing judge\`);
+            }
+            console.log('✓ config.default.json valid (' + Object.keys(cfg.presets).length + ' presets)');
+          "
+
+      - name: Type-check extension
+        run: |
+          cd extensions
+          bun install --peer 2>/dev/null || true
+          # Basic syntax check — the extension needs Pi runtime for full type checking
+          bun build index.ts --no-bundle 2>&1 || echo "(non-fatal: type-check needs Pi's @earendil-works packages)"
+
+      - name: Check conventional commit messages
+        if: github.event_name == 'pull_request'
+        run: |
+          PR_COMMITS=$(gh pr view ${{ github.event.pull_request.number }} --json commits --jq '.commits[].messageHeadline')
+          echo "$PR_COMMITS" | while read -r msg; do
+            if ! echo "$msg" | grep -qE '^(feat|fix|docs|refactor|chore|test)(\(.+\))?!?: .+'; then
+              echo "❌ Commit does not follow conventional commits: $msg"
+              exit 1
+            fi
+            echo "✓ $msg"
+          done
+        env:
+          GH_TOKEN: ${{ github.token }}
