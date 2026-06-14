@@ -1,0 +1,34 @@
+{
+  "name": "pi-fuse",
+  "version": "0.1.0",
+  "private": false,
+  "description": "Multi-model fusion provider for Pi — fan-out to Groq, Cerebras, DeepSeek, OpenRouter in parallel and synthesize with a judge. Install and it just works.",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "fuse",
+    "fusion",
+    "multi-model",
+    "pi-coding-agent"
+  ],
+  "license": "MIT",
+  "author": {
+    "name": "Evan O'Connor",
+    "url": "https://github.com/evanokeefe39"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/evanokeefe39/pi-fuse.git"
+  },
+  "bugs": {
+    "url": "https://github.com/evanokeefe39/pi-fuse/issues"
+  },
+  "homepage": "https://github.com/evanokeefe39/pi-fuse#readme",
+  "pi": {
+    "extensions": ["./extensions/index.ts"]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*"
+  }
+}
