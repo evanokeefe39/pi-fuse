@@ -25,7 +25,8 @@
   },
   "homepage": "https://github.com/evanokeefe39/pi-fuse#readme",
   "pi": {
-    "extensions": ["./extensions/index.ts"]
+    "extensions": ["./extensions/index.ts"],
+    "skills": ["./skills/fuse"]
   },
   "peerDependencies": {
     "@earendil-works/pi-ai": "*",
