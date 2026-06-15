@@ -32,6 +32,7 @@ import type {
   Context,
   Model,
   SimpleStreamOptions,
+  ThinkingContent,
   Api,
 } from "@earendil-works/pi-ai";
 import { createAssistantMessageEventStream, calculateCost } from "@earendil-works/pi-ai";
@@ -162,7 +163,8 @@ export default async function (pi: ExtensionAPI) {
     entry: ResolvedEndpoint,
     messages: { role: string; content: string }[],
     signal?: AbortSignal,
-    attempt = 1
+    attempt = 1,
+    onRetry?: (attempt: number) => void
   ): Promise<{ content: string; usage?: { input: number; output: number } }> {
     const headers: Record<string, string> = {
       "Content-Type": "application/json",
@@ -188,9 +190,10 @@ export default async function (pi: ExtensionAPI) {
       });
 
       if (res.status === 429 && attempt < 3) {
+        onRetry?.(attempt + 1);
         const backoff = Math.min(1000 * 2 ** attempt + jitterMs(0, 500), 5000);
         await new Promise((r) => setTimeout(r, backoff));
-        return callPanelModel(entry, messages, signal, attempt + 1);
+        return callPanelModel(entry, messages, signal, attempt + 1, onRetry);
       }
 
       if (!res.ok) {
@@ -252,7 +255,7 @@ export default async function (pi: ExtensionAPI) {
     let buffer = "";
 
     output.content.push({ type: "text", text: "" });
-    stream.push({ type: "text_start", contentIndex: 0, partial: output });
+    stream.push({ type: "text_start", contentIndex: 1, partial: output });
 
     let judgeInputTokens = 0;
     let judgeOutputTokens = 0;
@@ -285,11 +288,11 @@ export default async function (pi: ExtensionAPI) {
 
           const delta = chunk.choices?.[0]?.delta?.content;
           if (delta) {
-            const block = output.content[0];
+            const block = output.content[1];
             if (block.type === "text") {
               block.text += delta;
             }
-            stream.push({ type: "text_delta", contentIndex: 0, delta, partial: output });
+            stream.push({ type: "text_delta", contentIndex: 1, delta, partial: output });
           }
         } catch {
           // Skip malformed SSE lines
@@ -302,7 +305,7 @@ export default async function (pi: ExtensionAPI) {
     output.usage.totalTokens = judgeInputTokens + judgeOutputTokens;
     calculateCost(output as unknown as Model<typeof FUSE_API>, output.usage);
 
-    stream.push({ type: "text_end", contentIndex: 0, content: output.content[0]?.text ?? "", partial: output });
+    stream.push({ type: "text_end", contentIndex: 1, content: output.content[1]?.text ?? "", partial: output });
   }
 
   // ── Error stream for non-fuse models ──────────────────────────────────
@@ -356,8 +359,6 @@ export default async function (pi: ExtensionAPI) {
       };
 
       try {
-        stream.push({ type: "start", partial: output });
-
         // Refresh auth/models each fusion so cred changes take effect
         refreshConfigs();
 
@@ -366,6 +367,26 @@ export default async function (pi: ExtensionAPI) {
 
         const panelEntries = preset.panel.map(resolveModel);
         const judgeEntry = resolveModel(preset.judge);
+
+        // ── Thinking block for live progress ────────────────────────
+        const presetLabel = presetName.charAt(0).toUpperCase() + presetName.slice(1);
+        const thinkingHeader = `Fuse ${presetLabel} — ${panelEntries.length} panel + judge\n\n`;
+        output.content.push({
+          type: "thinking",
+          thinking: thinkingHeader,
+        } as ThinkingContent);
+        stream.push({ type: "start", partial: output });
+        stream.push({ type: "thinking_start", contentIndex: 0, partial: output });
+
+        function thinkPush(text: string) {
+          const block = output.content[0];
+          if (block.type === "thinking") {
+            block.thinking += text;
+          }
+          stream.push({ type: "thinking_delta", contentIndex: 0, delta: text, partial: output });
+        }
+
+        thinkPush(`  ⏳ Fanning out to ${panelEntries.length} models...\n`);
 
         // Convert Pi context to simple {role, content} format for panel models
         const contextMessages: { role: string; content: string }[] = [];
@@ -410,14 +431,29 @@ export default async function (pi: ExtensionAPI) {
           contextMessages.push({ role: "user", content: "..." });
         }
 
-        // ── Fan-out to panel models ──────────────────────────────────
+        // ── Fan-out to panel models with live status ────────────────
         const panelResults = await Promise.all(
           panelEntries.map(async (entry, idx) => {
             if (idx > 0) await new Promise((r) => setTimeout(r, jitterMs(50, 300)));
+            const t0 = performance.now();
+            const shortName = entry.model.split("/").pop()!;
             try {
-              const result = await callPanelModel(entry, contextMessages, signal);
+              const result = await callPanelModel(
+                entry,
+                contextMessages,
+                signal,
+                1,
+                (attempt) => {
+                  thinkPush(`  ⟳ ${entry.provider}:${shortName} — Retrying… (${attempt}/3)\n`);
+                }
+              );
+              const elapsed = ((performance.now() - t0) / 1000).toFixed(1);
+              thinkPush(`  ✓ ${entry.provider}:${shortName} ${elapsed}s\n`);
               return { label: `${entry.provider}:${entry.model}`, content: result.content };
             } catch (err) {
+              const elapsed = ((performance.now() - t0) / 1000).toFixed(1);
+              const errMsg = (err as Error).message.slice(0, 80);
+              thinkPush(`  ✗ ${entry.provider}:${shortName} ${elapsed}s — ${errMsg}\n`);
               return {
                 label: `${entry.provider}:${entry.model}`,
                 content: null,
@@ -443,6 +479,13 @@ export default async function (pi: ExtensionAPI) {
         const sections = succeeded.map(
           (r, i) => `--- Model ${i + 1} (${r.label}) ---\n\n${r.content}`
         );
+
+        const judgeShortName = judgeEntry.model.split("/").pop()!;
+        thinkPush(`\n→ Synthesizing with ${judgeEntry.provider}:${judgeShortName}...\n\n`);
+        const thinkingBlock = output.content[0];
+        if (thinkingBlock.type === "thinking") {
+          stream.push({ type: "thinking_end", contentIndex: 0, content: thinkingBlock.thinking, partial: output });
+        }
 
         const judgeMessages = [
           {

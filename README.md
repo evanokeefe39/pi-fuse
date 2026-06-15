@@ -17,7 +17,9 @@
 
 Register **fusion presets** as native Pi models. No external server — this extension registers a custom provider directly into Pi's model registry. Fuse models appear alongside Claude and GPT in `/model` and `Ctrl+P`.
 
-Fan out a prompt to multiple models in parallel (Groq, Cerebras, DeepSeek, OpenRouter), collect their responses, and synthesize the best answer with a judge model. **Better quality than any single model, at lower cost.**
+Fan out a prompt to multiple models in parallel (Groq, DeepSeek, OpenRouter, NVIDIA), collect their responses, and synthesize the best answer with a judge model. **Better quality than any single model, at lower cost.**
+
+Live thinking blocks show each panel model's progress in real time — no more spinner.
 
 ---
 
@@ -30,7 +32,7 @@ pi install git:github.com/evanokeefe39/pi-fuse
 # Option B: From local checkout
 pi install /path/to/pi-fuse
 
-# Start a session and pick "Fuse Spread" from Ctrl+P /model
+# Start a session and pick "Fuse Fast" or "Fuse Deep" from Ctrl+P /model
 pi
 ```
 
@@ -42,23 +44,27 @@ That's it. The extension ships with sensible default presets — no manual confi
 
 | Preset | Panel | Judge | Typical Time |
 |--------|-------|-------|-------------|
-| `fuse-fast` | Groq 8B + Groq Qwen3 32B | Groq 70B | ~1–2s |
-| `fuse-spread` | Groq 8B + DeepSeek Chat + Gemma 4 31B | Groq 70B | ~2–4s |
-| `fuse-deep` | Groq 70B + Nemotron 120B + Gemma 4 31B | Groq 70B | ~3–6s |
-| `fuse-quality` | Groq 70B + DeepSeek Chat | Groq 70B | ~3–6s |
-| `fuse-reason` | DeepSeek R1 + Groq 70B + Command R7B | Groq 70B | ~5–15s |
-| `fuse-budget` | DeepSeek Chat + cheap OpenRouter models | DeepSeek Chat | ~3–5s |
+| `fuse-fast` | DeepSeek V4 Flash + Groq 8B | DeepSeek V4 Flash | ~1–2s |
+| `fuse-deep` | DeepSeek Reasoner + DeepSeek V4 Flash + Groq 70B | DeepSeek Reasoner | ~3–8s |
 
-All presets use free-tier rate limits where available.
+Only two presets, both using reliable providers. No flaky free tiers.
 
 ## How It Works
 
 ```
-You ──► Pi selects fuse-spread ──► fuse-provider (streamSimple)
+You ──► Pi Ctrl+P → "Fuse Deep" ──► fuse-provider (streamSimple)
          │
-         ├── Panel[0] (Groq 8B) ──┐
-         ├── Panel[1] (DeepSeek) ──┤──► Judge (Groq 70B) ──► Streamed answer
-         └── Panel[2] (Gemma 4) ──┘
+         │  ┌─ Thinking block (live progress) ─────────────┐
+         │  │  ⏳ Fanning out to 3 models...                │
+         │  │  ✓ deepseek-v4-flash 1.2s                     │
+         │  │  ✓ deepseek-reasoner 2.8s                     │
+         │  │  ✓ groq-llama-3.3-70b 3.1s                   │
+         │  │  → Synthesizing judge response...             │
+         │  └──────────────────────────────────────────────┘
+         │
+         ├── Panel[0] (DeepSeek V4 Flash) ──┐
+         ├── Panel[1] (DeepSeek Reasoner) ──┤──► Judge (DeepSeek Reasoner) ──► Streamed answer
+         └── Panel[2] (Groq Llama 70B) ─────┘
 ```
 
 1. You select any `fuse-*` model via `/model` or `Ctrl+P`

@@ -38,31 +38,14 @@ on next fusion call (no restart needed).
 
 ## Presets
 
-Configured in `~/.pi/agent/skills/fuse/config.json`:
+Two focused presets using reliable providers:
 
 | Preset | Panel | Judge | Total Time |
 |--------|-------|-------|------------|
-| `fast` | Groq 8B + Groq Qwen3 32B | Groq 70B | ~1-2s |
-| `spread` | Groq 8B + Cerebras 70B + OR Qwen | Groq 70B | ~2-4s |
-| `deep` | Groq 70B + OR 70B + OR 405B | Groq 70B | ~3-6s |
-| `quality` | Groq 70B + Cerebras 70B + DeepSeek | Groq 70B | ~3-6s |
-| `reason` | DeepSeek R1 + Groq 70B + OR R1 | Groq 70B | ~5-15s |
-| `budget` | DeepSeek Chat + cheap OR models | DeepSeek Chat | ~3-5s |
+| `fast` | DeepSeek V4 Flash + Groq 8B | DeepSeek V4 Flash | ~1-2s |
+| `deep` | DeepSeek Reasoner + DeepSeek V4 Flash + Groq 70B | DeepSeek Reasoner | ~3-8s |
 
-All free-tier presets use providers' free rate limits. Budget uses
-paid models (~$0.0001/fusion) when free limits are exhausted.
-
-## Why Multi-Provider
-
-| Provider | Free Tier | Strengths |
-|----------|-----------|-----------|
-| **Groq** | 30 req/min (70B), 6000/min (8B) | Fastest inference |
-| **Cerebras** | Free | Fast 70B |
-| **DeepSeek** | Paid ($0.14/M) | High quality, reasoning |
-| **OpenRouter** | 50 req/day free | Most model diversity |
-
-Spreading across providers means no single rate limit gets burned
-and model diversity improves fusion quality.
+Progress is shown live in a thinking block as each panel model responds.
 
 ## Config
 

@@ -1,29 +1,13 @@
 {
-  "default_preset": "spread",
+  "default_preset": "fast",
   "presets": {
     "fast": {
-      "panel": ["groq:llama-3.1-8b-instant", "groq:qwen/qwen3-32b"],
-      "judge": "groq:llama-3.3-70b-versatile"
-    },
-    "spread": {
-      "panel": ["groq:llama-3.1-8b-instant", "deepseek:deepseek-chat", "openrouter:google/gemma-4-31b-it:free"],
-      "judge": "groq:llama-3.3-70b-versatile"
+      "panel": ["deepseek:deepseek-v4-flash", "groq:llama-3.1-8b-instant"],
+      "judge": "deepseek:deepseek-v4-flash"
     },
     "deep": {
-      "panel": ["groq:llama-3.3-70b-versatile", "openrouter:nvidia/nemotron-3-super-120b-a12b:free", "openrouter:google/gemma-4-31b-it:free"],
-      "judge": "groq:llama-3.3-70b-versatile"
-    },
-    "quality": {
-      "panel": ["groq:llama-3.3-70b-versatile", "deepseek:deepseek-chat"],
-      "judge": "groq:llama-3.3-70b-versatile"
-    },
-    "reason": {
-      "panel": ["deepseek:deepseek-reasoner", "groq:llama-3.3-70b-versatile", "openrouter:cohere/command-r7b-12-2024"],
-      "judge": "groq:llama-3.3-70b-versatile"
-    },
-    "budget": {
-      "panel": ["deepseek:deepseek-chat", "openrouter:cohere/command-r7b-12-2024", "openrouter:minimax/minimax-m2.7"],
-      "judge": "deepseek:deepseek-chat"
+      "panel": ["deepseek:deepseek-reasoner", "deepseek:deepseek-v4-flash", "groq:llama-3.3-70b-versatile"],
+      "judge": "deepseek:deepseek-reasoner"
     }
   }
 }
