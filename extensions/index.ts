@@ -32,6 +32,7 @@ import type {
   Context,
   Model,
   SimpleStreamOptions,
+  Api,
 } from "@earendil-works/pi-ai";
 import { createAssistantMessageEventStream, calculateCost } from "@earendil-works/pi-ai";
 
@@ -123,7 +124,7 @@ export default async function (pi: ExtensionAPI) {
   // Dynamic: re-read auth/models at request time so credential changes
   // are picked up without /reload. The cache is a simple module-level
   // ref that gets refreshed per fusion.
-  let authCache: Record<string, string> = tryLoad(AUTH_PATH) ?? {};
+  let authCache: Record<string, any> = tryLoad(AUTH_PATH) ?? {};
   let modelsCache: { providers: Record<string, ProviderDef> } =
     tryLoad(MODELS_PATH) ?? { providers: {} };
 
@@ -138,15 +139,19 @@ export default async function (pi: ExtensionAPI) {
       throw new Error(
         `Unknown provider "${provider}". Valid: ${Object.keys(modelsCache.providers || {}).join(", ")}`
       );
-    const apiKey = authCache[provDef.apiKey] ?? process.env[provDef.apiKey];
+    const apiKey =
+      authCache[provider]?.key ||
+      authCache[provDef.apiKey] ||
+      process.env[provDef.apiKey.replace(/^\$/, "")] ||
+      provDef.apiKey;
     if (!apiKey)
-      throw new Error(`No API key for "${provider}" (${provDef.apiKey}). Check auth.json or env.`);
+      throw new Error(`No API key for "${provider}". Add to auth.json as {"${provider}":{"key":"sk-..."}} or set ${provDef.apiKey.replace(/^\$/, "")} env var.`);
     return { provider, model, baseUrl: provDef.baseUrl, apiKey };
   }
 
   // ── Refresh auth/models from disk ─────────────────────────────────────
   function refreshConfigs() {
-    const fresh = tryLoad<Record<string, string>>(AUTH_PATH);
+    const fresh = tryLoad<Record<string, any>>(AUTH_PATH);
     if (fresh) authCache = fresh;
     const freshModels = tryLoad<{ providers: Record<string, ProviderDef> }>(MODELS_PATH);
     if (freshModels) modelsCache = freshModels;
@@ -295,9 +300,31 @@ export default async function (pi: ExtensionAPI) {
     output.usage.input = judgeInputTokens;
     output.usage.output = judgeOutputTokens;
     output.usage.totalTokens = judgeInputTokens + judgeOutputTokens;
-    calculateCost(output as unknown as Model<"openai-completions">, output.usage);
+    calculateCost(output as unknown as Model<typeof FUSE_API>, output.usage);
 
     stream.push({ type: "text_end", contentIndex: 0, content: output.content[0]?.text ?? "", partial: output });
+  }
+
+  // ── Error stream for non-fuse models ──────────────────────────────────
+  function createErrorStream(errorMessage: string): AssistantMessageEventStream {
+    const stream = createAssistantMessageEventStream();
+    const output: AssistantMessage = {
+      role: "assistant",
+      content: [],
+      api: FUSE_API,
+      provider: "fuse",
+      model: "fuse-unknown",
+      usage: {
+        input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+      },
+      stopReason: "error",
+      errorMessage,
+      timestamp: Date.now(),
+    };
+    stream.push({ type: "error", reason: "error", error: output });
+    stream.end();
+    return stream;
   }
 
   // ── Main fusion stream factory ────────────────────────────────────────
@@ -313,7 +340,7 @@ export default async function (pi: ExtensionAPI) {
       const output: AssistantMessage = {
         role: "assistant",
         content: [],
-        api: "openai-completions" as const,
+        api: FUSE_API,
         provider: "fuse",
         model: `fuse-${presetName}`,
         usage: {
@@ -470,15 +497,22 @@ export default async function (pi: ExtensionAPI) {
     },
   }));
 
+  const FUSE_API = "fuse" as Api;
+
   // ── Register the provider ─────────────────────────────────────────────
   pi.registerProvider("fuse", {
     name: "Fuse Fusion",
     baseUrl: "http://localhost:8160",
     apiKey: "__fuse_provider__",
-    api: "openai-completions",
+    api: FUSE_API,
     models,
 
-    streamSimple: (model: Model<"openai-completions">, context: Context, options?: SimpleStreamOptions) => {
+    streamSimple: (model: Model<typeof FUSE_API>, context: Context, options?: SimpleStreamOptions) => {
+      // Defensive: only handle fuse-* model IDs. If Pi misroutes a non-fuse
+      // model here, return an immediate error stream instead of crashing.
+      if (!model.id.startsWith("fuse-") || !fuseConfig.presets[model.id.slice(5)]) {
+        return createErrorStream(`fuse: "${model.id}" is not a registered fuse preset`);
+      }
       const presetName = model.id.replace(/^fuse-/, "");
       return createFuseStream(presetName, context, options);
     },
