@@ -68,6 +68,20 @@ interface ResolvedEndpoint {
   apiKey: string;
 }
 
+interface AuthEntry {
+  key: string;
+  type?: string;
+}
+
+interface ModelsFile {
+  providers: Record<string, {
+    baseUrl: string;
+    apiKey: string;
+    api?: string;
+    models?: { id: string; name: string }[];
+  }>;
+}
+
 // ── File helpers ──────────────────────────────────────────────────────────
 
 function tryLoad<T>(path: string): T | null {
@@ -76,6 +90,100 @@ function tryLoad<T>(path: string): T | null {
   } catch {
     return null;
   }
+}
+
+// ── Validated loaders for auth and models ────────────────────────────────
+
+function loadAuth(): Record<string, AuthEntry> {
+  try {
+    const raw = JSON.parse(readFileSync(AUTH_PATH, "utf-8")) as Record<string, unknown>;
+    if (!raw || typeof raw !== "object") {
+      console.error("[pi-fuse] auth.json: not a valid JSON object");
+      return {};
+    }
+    for (const [provider, val] of Object.entries(raw)) {
+      if (!val || typeof val !== "object") {
+        console.error(`[pi-fuse] auth.json: "${provider}" is not an object — skipping`);
+        continue;
+      }
+      const entry = val as Record<string, unknown>;
+      if (typeof entry.key !== "string" || !entry.key) {
+        console.error(`[pi-fuse] auth.json: "${provider}" missing or empty "key" field — skipping`);
+        continue;
+      }
+    }
+    return raw as Record<string, AuthEntry>;
+  } catch (err) {
+    if (err instanceof SyntaxError) {
+      console.error("[pi-fuse] auth.json: invalid JSON — returning empty config");
+    } else {
+      console.error("[pi-fuse] auth.json: unexpected error:", (err as Error)?.message ?? err);
+    }
+    return {};
+  }
+}
+
+function loadModels(): ModelsFile {
+  try {
+    const raw = JSON.parse(readFileSync(MODELS_PATH, "utf-8")) as Record<string, unknown>;
+    if (!raw || typeof raw !== "object") {
+      console.error("[pi-fuse] models.json: not a valid JSON object");
+      return { providers: {} };
+    }
+    const providers = (raw as any).providers;
+    if (!providers || typeof providers !== "object") {
+      console.error("[pi-fuse] models.json: missing or invalid 'providers' key");
+      return { providers: {} };
+    }
+    for (const [name, def] of Object.entries(providers)) {
+      if (!def || typeof def !== "object") {
+        console.error(`[pi-fuse] models.json: provider "${name}" is not an object — skipping`);
+        continue;
+      }
+      const d = def as Record<string, unknown>;
+      if (typeof d.baseUrl !== "string" || !d.baseUrl) {
+        console.error(`[pi-fuse] models.json: provider "${name}" missing or invalid 'baseUrl' — skipping`);
+        continue;
+      }
+      if (typeof d.apiKey !== "string" || !d.apiKey) {
+        console.error(`[pi-fuse] models.json: provider "${name}" missing or invalid 'apiKey' — skipping`);
+        continue;
+      }
+    }
+    return raw as unknown as ModelsFile;
+  } catch (err) {
+    if (err instanceof SyntaxError) {
+      console.error("[pi-fuse] models.json: invalid JSON — returning empty config");
+    } else {
+      console.error("[pi-fuse] models.json: unexpected error:", (err as Error)?.message ?? err);
+    }
+    return { providers: {} };
+  }
+}
+
+// ── Preset validation ─────────────────────────────────────────────────────
+
+function validatePresets(config: FuseConfig): FuseConfig {
+  for (const [name, preset] of Object.entries(config.presets)) {
+    if (!Array.isArray(preset.panel) || preset.panel.length === 0) {
+      console.error(`[pi-fuse] Preset "${name}" has invalid or empty 'panel' — removing`);
+      delete config.presets[name];
+      continue;
+    }
+    if (typeof preset.judge !== "string" || !preset.judge) {
+      console.error(`[pi-fuse] Preset "${name}" has invalid or empty 'judge' — removing`);
+      delete config.presets[name];
+      continue;
+    }
+    for (const [i, ref] of preset.panel.entries()) {
+      if (typeof ref !== "string" || !ref.includes(":")) {
+        console.error(`[pi-fuse] Preset "${name}" panel[${i}]: "${ref}" missing 'provider:model' format — removing preset`);
+        delete config.presets[name];
+        break;
+      }
+    }
+  }
+  return config;
 }
 
 // ── Config loader with layered fallback ──────────────────────────────────
@@ -93,21 +201,70 @@ function loadConfig(): FuseConfig {
     const user = tryLoad<FuseConfig>(USER_CONFIG);
     if (user) {
       // Merge: user presets override bundled ones, default_preset from user wins
-      return {
+      return validatePresets({
         default_preset: user.default_preset || bundled.default_preset,
         presets: { ...bundled.presets, ...user.presets },
-      };
+      });
     }
     console.error("[pi-fuse] User config at", USER_CONFIG, "is invalid JSON — falling back to defaults");
   }
 
-  return bundled;
+  return validatePresets(bundled);
 }
 
 // ── Jitter helper ──────────────────────────────────────────────────────────
 
 function jitterMs(min = 0, max = 500) {
   return Math.floor(Math.random() * (max - min + 1)) + min;
+}
+
+// ── Circuit breaker ─────────────────────────────────────────────────────────
+// Per-provider failure tracking: after N consecutive failures, skip the
+// provider for M seconds. Resets on success.
+
+interface CircuitState {
+  failures: number;
+  openedAt: number; // 0 = circuit closed
+}
+
+const CIRCUIT_THRESHOLD = 3;       // Consecutive failures before opening
+const CIRCUIT_COOLDOWN_MS = 30_000; // Milliseconds before retrying an open circuit
+
+// Module-level state persists across all fusion calls
+const circuitBreakers = new Map<string, CircuitState>();
+
+function recordSuccess(provider: string): void {
+  const state = circuitBreakers.get(provider);
+  if (state) {
+    state.failures = 0;
+    state.openedAt = 0;
+  }
+}
+
+function recordFailure(provider: string): void {
+  let state = circuitBreakers.get(provider);
+  if (!state) {
+    state = { failures: 0, openedAt: 0 };
+    circuitBreakers.set(provider, state);
+  }
+  state.failures++;
+  if (state.failures >= CIRCUIT_THRESHOLD) {
+    state.openedAt = Date.now();
+    console.error(`[pi-fuse] Circuit opened for "${provider}" — ${state.failures} consecutive failures`);
+  }
+}
+
+function isCircuitOpen(provider: string): boolean {
+  const state = circuitBreakers.get(provider);
+  if (!state || state.openedAt === 0) return false;
+  if (Date.now() - state.openedAt > CIRCUIT_COOLDOWN_MS) {
+    // Cooldown expired — close circuit (half-open), allow one request
+    state.failures = 0;
+    state.openedAt = 0;
+    console.error(`[pi-fuse] Circuit closing for "${provider}" — cooldown expired`);
+    return false;
+  }
+  return true;
 }
 
 // ── Extension entry point ──────────────────────────────────────────────────
@@ -125,9 +282,8 @@ export default async function (pi: ExtensionAPI) {
   // Dynamic: re-read auth/models at request time so credential changes
   // are picked up without /reload. The cache is a simple module-level
   // ref that gets refreshed per fusion.
-  let authCache: Record<string, any> = tryLoad(AUTH_PATH) ?? {};
-  let modelsCache: { providers: Record<string, ProviderDef> } =
-    tryLoad(MODELS_PATH) ?? { providers: {} };
+  let authCache: Record<string, AuthEntry> = loadAuth();
+  let modelsCache: ModelsFile = loadModels();
 
   // ── Resolve "provider:model" → endpoint with live config ──────────────
   function resolveModel(ref: string): ResolvedEndpoint {
@@ -152,10 +308,10 @@ export default async function (pi: ExtensionAPI) {
 
   // ── Refresh auth/models from disk ─────────────────────────────────────
   function refreshConfigs() {
-    const fresh = tryLoad<Record<string, any>>(AUTH_PATH);
-    if (fresh) authCache = fresh;
-    const freshModels = tryLoad<{ providers: Record<string, ProviderDef> }>(MODELS_PATH);
-    if (freshModels) modelsCache = freshModels;
+    const fresh = loadAuth();
+    if (Object.keys(fresh).length > 0) authCache = fresh;
+    const freshModels = loadModels();
+    if (Object.keys(freshModels.providers).length > 0) modelsCache = freshModels;
   }
 
   // ── Call one panel model (non-streaming, with 429 retry) ──────────────
@@ -206,6 +362,7 @@ export default async function (pi: ExtensionAPI) {
         usage?: { prompt_tokens: number; completion_tokens: number };
       };
 
+      recordSuccess(entry.provider);
       return {
         content: data.choices?.[0]?.message?.content ?? "[no output]",
         usage: data.usage
@@ -295,7 +452,10 @@ export default async function (pi: ExtensionAPI) {
             stream.push({ type: "text_delta", contentIndex: 1, delta, partial: output });
           }
         } catch {
-          // Skip malformed SSE lines
+          // Malformed SSE line — skip. Log truncated line for debugging.
+          if (trimmed.length < 200) {
+            console.debug("[pi-fuse] SSE parse skip:", trimmed.slice(0, 100));
+          }
         }
       }
     }
@@ -369,6 +529,12 @@ export default async function (pi: ExtensionAPI) {
 
         const panelEntries = preset.panel.map(resolveModel);
         const judgeEntry = resolveModel(preset.judge);
+        // Circuit breaker: fail fast if judge provider circuit is open
+        if (isCircuitOpen(judgeEntry.provider)) {
+          throw new Error(
+            `Judge circuit open for "${judgeEntry.provider}" — ${CIRCUIT_THRESHOLD} consecutive failures, cooling down for ${CIRCUIT_COOLDOWN_MS / 1000}s`
+          );
+        }
 
         // ── Thinking block for live progress ────────────────────────
         const presetLabel = presetName.charAt(0).toUpperCase() + presetName.slice(1);
@@ -437,8 +603,17 @@ export default async function (pi: ExtensionAPI) {
         const panelResults = await Promise.all(
           panelEntries.map(async (entry, idx) => {
             if (idx > 0) await new Promise((r) => setTimeout(r, jitterMs(50, 300)));
-            const t0 = performance.now();
             const shortName = entry.model.split("/").pop()!;
+            // Circuit breaker: skip if provider has too many consecutive failures
+            if (isCircuitOpen(entry.provider)) {
+              thinkPush(`  ⊘ ${entry.provider}:${shortName} — circuit open (${CIRCUIT_THRESHOLD}+ failures)\n`);
+              return {
+                label: `${entry.provider}:${entry.model}`,
+                content: null,
+                error: `Circuit open for ${entry.provider} — skipping after ${CIRCUIT_THRESHOLD} consecutive failures`,
+              };
+            }
+            const t0 = performance.now();
             try {
               const result = await callPanelModel(
                 entry,
@@ -453,6 +628,7 @@ export default async function (pi: ExtensionAPI) {
               thinkPush(`  ✓ ${entry.provider}:${shortName} ${elapsed}s\n`);
               return { label: `${entry.provider}:${entry.model}`, content: result.content };
             } catch (err) {
+              recordFailure(entry.provider);
               const elapsed = ((performance.now() - t0) / 1000).toFixed(1);
               const errMsg = (err as Error).message.slice(0, 80);
               thinkPush(`  ✗ ${entry.provider}:${shortName} ${elapsed}s — ${errMsg}\n`);
@@ -517,6 +693,7 @@ export default async function (pi: ExtensionAPI) {
         });
         stream.end();
       } catch (err) {
+        console.error(`[pi-fuse] Fusion error:`, (err as Error)?.message ?? err);
         output.stopReason = "error";
         output.errorMessage = (err as Error).message;
         stream.push({ type: "error", reason: "error", error: output });
