@@ -35,7 +35,7 @@ import type {
   ThinkingContent,
   Api,
 } from "@earendil-works/pi-ai";
-import { createAssistantMessageEventStream, calculateCost } from "@earendil-works/pi-ai";
+import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
 
 // ── Resolve package root for bundled config ───────────────────────────────
 // import.meta.url works because Pi loads extensions via jiti/ts
@@ -303,7 +303,9 @@ export default async function (pi: ExtensionAPI) {
     output.usage.input = judgeInputTokens;
     output.usage.output = judgeOutputTokens;
     output.usage.totalTokens = judgeInputTokens + judgeOutputTokens;
-    calculateCost(output as unknown as Model<typeof FUSE_API>, output.usage);
+    // Manually zero cost — panel/judge providers are free-tier or negligible.
+    // calculateCost() would need a Model object, not an AssistantMessage.
+    output.usage.cost = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 };
 
     stream.push({ type: "text_end", contentIndex: 1, content: output.content[1]?.text ?? "", partial: output });
   }
