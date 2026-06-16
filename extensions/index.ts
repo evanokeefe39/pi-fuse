@@ -66,6 +66,7 @@ interface ResolvedEndpoint {
   model: string;
   baseUrl: string;
   apiKey: string;
+  contextWindow?: number;
 }
 
 interface AuthEntry {
@@ -218,6 +219,64 @@ function jitterMs(min = 0, max = 500) {
   return Math.floor(Math.random() * (max - min + 1)) + min;
 }
 
+// ── Token estimation / context truncation ─────────────────────────────────
+// Rough: ~3.5 chars per token. Over-estimates for code, fine for truncation.
+function estimateTokens(text: string): number {
+  return Math.ceil(text.length / 3.5);
+}
+
+function truncateMessages(
+  msgs: { role: string; content: string }[],
+  maxTokens: number
+): { messages: { role: string; content: string }[]; truncated: { droppedSystem: boolean; droppedHistory: number; trimmedMessage: boolean } } {
+  const result: { droppedSystem: boolean; droppedHistory: number; trimmedMessage: boolean } = {
+    droppedSystem: false,
+    droppedHistory: 0,
+    trimmedMessage: false,
+  };
+
+  // Panel models only need the question — no system prompt (it's just skill
+  // instructions for the main agent, irrelevant to panel models). Keep the
+  // last ~2 exchanges to provide minimal context.
+  const lastUser = [...msgs].reverse().find((m) => m.role === "user");
+  if (!lastUser) return { messages: msgs.slice(-1), truncated: result };
+
+  let tokenBudget = maxTokens - 512; // reserve for JSON overhead + output headroom
+  if (tokenBudget <= 0) tokenBudget = 256;
+
+  // Walk backwards from the end, collect messages newest-first
+  const reversed = [...msgs].reverse();
+  const collected: { role: string; content: string }[] = [];
+  let origCount = 0;
+  for (const m of reversed) {
+    if (m.role === "system") {
+      result.droppedSystem = true;
+      continue;
+    }
+    origCount++;
+    const t = estimateTokens(m.content);
+    if (t <= tokenBudget) {
+      collected.push(m);
+      tokenBudget -= t;
+    } else if (m === lastUser || collected.length === 0) {
+      // Always include the user message — trim it as last resort
+      const trimmed = m.content.slice(0, Math.max(50, Math.floor(tokenBudget * 3.5)));
+      collected.push({ ...m, content: trimmed });
+      result.trimmedMessage = true;
+      break;
+    }
+    if (collected.length >= 4) break;
+  }
+
+  result.droppedHistory = origCount - collected.length;
+  // If original had a system prompt, mark it as dropped (it was skipped in the loop)
+  if (!result.droppedSystem && msgs.some((m) => m.role === "system")) {
+    result.droppedSystem = true;
+  }
+  // Reverse back to chronological order
+  return { messages: collected.reverse(), truncated: result };
+}
+
 // ── Circuit breaker ─────────────────────────────────────────────────────────
 // Per-provider failure tracking: after N consecutive failures, skip the
 // provider for M seconds. Resets on success.
@@ -303,7 +362,10 @@ export default async function (pi: ExtensionAPI) {
       provDef.apiKey;
     if (!apiKey)
       throw new Error(`No API key for "${provider}". Add to auth.json as {"${provider}":{"key":"sk-..."}} or set ${provDef.apiKey.replace(/^\$/, "")} env var.`);
-    return { provider, model, baseUrl: provDef.baseUrl, apiKey };
+    // Look up the model's contextWindow from provider model list
+    const modDef = (provDef as any).models?.find((m: any) => m.id === model);
+    const contextWindow = modDef?.contextWindow ?? undefined;
+    return { provider, model, baseUrl: provDef.baseUrl, apiKey, contextWindow };
   }
 
   // ── Refresh auth/models from disk ─────────────────────────────────────
@@ -615,9 +677,20 @@ export default async function (pi: ExtensionAPI) {
             }
             const t0 = performance.now();
             try {
+              // Truncate context to fit this model's limits
+              const ctxWindow = entry.contextWindow ?? 128000;
+              // Reserve 4096 for output; TPM-limited models (free Groq) need
+              // tighter truncation — use contextWindow or 4000, whichever is smaller
+              const maxInput = Math.min(ctxWindow - 4096, 4000);
+              const { messages: panelMsgs, truncated } = truncateMessages(contextMessages, maxInput);
+              if (truncated.droppedSystem) {
+                thinkPush(`  ⚠ ${entry.provider}:${shortName} — dropped system prompt (context too large)\n`);
+              } else if (truncated.droppedHistory > 0 || truncated.trimmedMessage) {
+                thinkPush(`  ⚠ ${entry.provider}:${shortName} — context trimmed (${truncated.droppedHistory} msgs dropped${truncated.trimmedMessage ? ', msg truncated' : ''})\n`);
+              }
               const result = await callPanelModel(
                 entry,
-                contextMessages,
+                panelMsgs,
                 signal,
                 1,
                 (attempt) => {
