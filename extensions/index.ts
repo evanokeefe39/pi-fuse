@@ -228,16 +228,15 @@ function estimateTokens(text: string): number {
 function truncateMessages(
   msgs: { role: string; content: string }[],
   maxTokens: number
-): { messages: { role: string; content: string }[]; truncated: { droppedSystem: boolean; droppedHistory: number; trimmedMessage: boolean } } {
-  const result: { droppedSystem: boolean; droppedHistory: number; trimmedMessage: boolean } = {
-    droppedSystem: false,
+): { messages: { role: string; content: string }[]; truncated: { droppedHistory: number; trimmedMessage: boolean } } {
+  const result: { droppedHistory: number; trimmedMessage: boolean } = {
     droppedHistory: 0,
     trimmedMessage: false,
   };
 
   // Panel models only need the question — no system prompt (it's just skill
-  // instructions for the main agent, irrelevant to panel models). Keep the
-  // last ~2 exchanges to provide minimal context.
+  // instructions for the main agent, irrelevant to panel models). Keep as
+  // many recent messages as fit in the context window.
   const lastUser = [...msgs].reverse().find((m) => m.role === "user");
   if (!lastUser) return { messages: msgs.slice(-1), truncated: result };
 
@@ -249,10 +248,7 @@ function truncateMessages(
   const collected: { role: string; content: string }[] = [];
   let origCount = 0;
   for (const m of reversed) {
-    if (m.role === "system") {
-      result.droppedSystem = true;
-      continue;
-    }
+    if (m.role === "system") continue;
     origCount++;
     const t = estimateTokens(m.content);
     if (t <= tokenBudget) {
@@ -265,14 +261,10 @@ function truncateMessages(
       result.trimmedMessage = true;
       break;
     }
-    if (collected.length >= 4) break;
+
   }
 
   result.droppedHistory = origCount - collected.length;
-  // If original had a system prompt, mark it as dropped (it was skipped in the loop)
-  if (!result.droppedSystem && msgs.some((m) => m.role === "system")) {
-    result.droppedSystem = true;
-  }
   // Reverse back to chronological order
   return { messages: collected.reverse(), truncated: result };
 }
@@ -679,13 +671,9 @@ export default async function (pi: ExtensionAPI) {
             try {
               // Truncate context to fit this model's limits
               const ctxWindow = entry.contextWindow ?? 128000;
-              // Reserve 4096 for output; TPM-limited models (free Groq) need
-              // tighter truncation — use contextWindow or 4000, whichever is smaller
-              const maxInput = Math.min(ctxWindow - 4096, 4000);
+              const maxInput = ctxWindow - 4096;
               const { messages: panelMsgs, truncated } = truncateMessages(contextMessages, maxInput);
-              if (truncated.droppedSystem) {
-                thinkPush(`  ⚠ ${entry.provider}:${shortName} — dropped system prompt (context too large)\n`);
-              } else if (truncated.droppedHistory > 0 || truncated.trimmedMessage) {
+              if (truncated.droppedHistory > 0 || truncated.trimmedMessage) {
                 thinkPush(`  ⚠ ${entry.provider}:${shortName} — context trimmed (${truncated.droppedHistory} msgs dropped${truncated.trimmedMessage ? ', msg truncated' : ''})\n`);
               }
               const result = await callPanelModel(
