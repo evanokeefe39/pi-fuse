@@ -8,9 +8,9 @@
  *   fused through OpenRouter, outscored GPT-5.5 and Claude Opus 4.8 on 100
  *   complex research tasks (June 2026).
  *
- * Fans out to multiple models (Groq, Cerebras, DeepSeek, OpenRouter) in
- * parallel, collects their responses, and synthesizes the best answer via
- * a judge model. All inside Pi's process — no external server needed.
+ * Fans out to multiple models (DeepSeek, Groq, OpenRouter, etc.) in parallel,
+ * collects their responses, and synthesizes the best answer via a judge model.
+ * All inside Pi's process — no external server needed.
  *
  * Presets are defined in a bundled config.default.json. Users can override
  * presets by creating ~/.pi/agent/skills/fuse/config.json (shared with the
@@ -21,7 +21,7 @@
  *     Or:  pi install /path/to/pi-fuse
  */
 
-import { readFileSync, existsSync } from "node:fs";
+import { readFileSync, existsSync, writeFileSync, mkdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -38,14 +38,14 @@ import type {
 import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
 
 // ── Resolve package root for bundled config ───────────────────────────────
-// import.meta.url works because Pi loads extensions via jiti/ts
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const PACKAGE_ROOT = join(__dirname, "..");
 const BUNDLED_CONFIG = join(PACKAGE_ROOT, "config.default.json");
 
 // ── User override path (shared with fuse CLI/server skill) ────────────────
 const HOME = homedir();
-const USER_CONFIG = join(HOME, ".pi/agent/skills/fuse/config.json");
+const USER_CONFIG = join(HOME, ".pi/agent/extensions/fuse.json");
+const OLD_USER_CONFIG = join(HOME, ".pi/agent/skills/fuse/config.json");
 const AUTH_PATH = join(HOME, ".pi/agent/auth.json");
 const MODELS_PATH = join(HOME, ".pi/agent/models.json");
 
@@ -56,171 +56,89 @@ interface FuseConfig {
   presets: Record<string, { panel: string[]; judge: string }>;
 }
 
-interface ProviderDef {
-  baseUrl: string;
-  apiKey: string;
-}
-
 interface ResolvedEndpoint {
   provider: string;
   model: string;
   baseUrl: string;
   apiKey: string;
   contextWindow?: number;
+  maxInput?: number;
 }
 
 interface AuthEntry {
   key: string;
-  type?: string;
 }
 
 interface ModelsFile {
   providers: Record<string, {
     baseUrl: string;
     apiKey: string;
-    api?: string;
-    models?: { id: string; name: string }[];
+    models?: { id: string; name: string; contextWindow?: number; maxInput?: number }[];
   }>;
 }
 
 // ── File helpers ──────────────────────────────────────────────────────────
 
 function tryLoad<T>(path: string): T | null {
-  try {
-    return JSON.parse(readFileSync(path, "utf-8")) as T;
-  } catch {
-    return null;
-  }
+  try { return JSON.parse(readFileSync(path, "utf-8")) as T; }
+  catch { return null; }
 }
-
-// ── Validated loaders for auth and models ────────────────────────────────
 
 function loadAuth(): Record<string, AuthEntry> {
   try {
-    const raw = JSON.parse(readFileSync(AUTH_PATH, "utf-8")) as Record<string, unknown>;
-    if (!raw || typeof raw !== "object") {
-      console.error("[pi-fuse] auth.json: not a valid JSON object");
-      return {};
-    }
-    for (const [provider, val] of Object.entries(raw)) {
-      if (!val || typeof val !== "object") {
-        console.error(`[pi-fuse] auth.json: "${provider}" is not an object — skipping`);
-        continue;
-      }
-      const entry = val as Record<string, unknown>;
-      if (typeof entry.key !== "string" || !entry.key) {
-        console.error(`[pi-fuse] auth.json: "${provider}" missing or empty "key" field — skipping`);
-        continue;
-      }
-    }
-    return raw as Record<string, AuthEntry>;
-  } catch (err) {
-    if (err instanceof SyntaxError) {
-      console.error("[pi-fuse] auth.json: invalid JSON — returning empty config");
-    } else {
-      console.error("[pi-fuse] auth.json: unexpected error:", (err as Error)?.message ?? err);
-    }
+    const raw = JSON.parse(readFileSync(AUTH_PATH, "utf-8")) as Record<string, AuthEntry>;
+    return typeof raw === "object" && raw !== null ? raw : {};
+  } catch {
     return {};
   }
 }
 
 function loadModels(): ModelsFile {
   try {
-    const raw = JSON.parse(readFileSync(MODELS_PATH, "utf-8")) as Record<string, unknown>;
-    if (!raw || typeof raw !== "object") {
-      console.error("[pi-fuse] models.json: not a valid JSON object");
-      return { providers: {} };
-    }
-    const providers = (raw as any).providers;
-    if (!providers || typeof providers !== "object") {
-      console.error("[pi-fuse] models.json: missing or invalid 'providers' key");
-      return { providers: {} };
-    }
-    for (const [name, def] of Object.entries(providers)) {
-      if (!def || typeof def !== "object") {
-        console.error(`[pi-fuse] models.json: provider "${name}" is not an object — skipping`);
-        continue;
-      }
-      const d = def as Record<string, unknown>;
-      if (typeof d.baseUrl !== "string" || !d.baseUrl) {
-        console.error(`[pi-fuse] models.json: provider "${name}" missing or invalid 'baseUrl' — skipping`);
-        continue;
-      }
-      if (typeof d.apiKey !== "string" || !d.apiKey) {
-        console.error(`[pi-fuse] models.json: provider "${name}" missing or invalid 'apiKey' — skipping`);
-        continue;
-      }
-    }
-    return raw as unknown as ModelsFile;
-  } catch (err) {
-    if (err instanceof SyntaxError) {
-      console.error("[pi-fuse] models.json: invalid JSON — returning empty config");
-    } else {
-      console.error("[pi-fuse] models.json: unexpected error:", (err as Error)?.message ?? err);
-    }
+    const raw = JSON.parse(readFileSync(MODELS_PATH, "utf-8")) as ModelsFile;
+    return raw?.providers ? raw : { providers: {} };
+  } catch {
     return { providers: {} };
   }
 }
 
-// ── Preset validation ─────────────────────────────────────────────────────
-
-function validatePresets(config: FuseConfig): FuseConfig {
-  for (const [name, preset] of Object.entries(config.presets)) {
-    if (!Array.isArray(preset.panel) || preset.panel.length === 0) {
-      console.error(`[pi-fuse] Preset "${name}" has invalid or empty 'panel' — removing`);
-      delete config.presets[name];
-      continue;
-    }
-    if (typeof preset.judge !== "string" || !preset.judge) {
-      console.error(`[pi-fuse] Preset "${name}" has invalid or empty 'judge' — removing`);
-      delete config.presets[name];
-      continue;
-    }
-    for (const [i, ref] of preset.panel.entries()) {
-      if (typeof ref !== "string" || !ref.includes(":")) {
-        console.error(`[pi-fuse] Preset "${name}" panel[${i}]: "${ref}" missing 'provider:model' format — removing preset`);
-        delete config.presets[name];
-        break;
-      }
-    }
-  }
-  return config;
-}
-
-// ── Config loader with layered fallback ──────────────────────────────────
+// ── Simple preset validation ──────────────────────────────────────────────
+// ponytail: only checks format — malformed configs crash with their own error
 
 function loadConfig(): FuseConfig {
-  // 1. Try bundled defaults first (always present inside the package)
   const bundled = tryLoad<FuseConfig>(BUNDLED_CONFIG);
   if (!bundled) {
     console.error("[pi-fuse] Missing bundled config.default.json — package may be corrupted");
     return { default_preset: "spread", presets: {} };
   }
-
-  // 2. Check for user override
-  if (existsSync(USER_CONFIG)) {
-    const user = tryLoad<FuseConfig>(USER_CONFIG);
-    if (user) {
-      // Merge: user presets override bundled ones, default_preset from user wins
-      return validatePresets({
-        default_preset: user.default_preset || bundled.default_preset,
-        presets: { ...bundled.presets, ...user.presets },
-      });
-    }
-    console.error("[pi-fuse] User config at", USER_CONFIG, "is invalid JSON — falling back to defaults");
+  if (existsSync(OLD_USER_CONFIG) && !existsSync(USER_CONFIG)) {
+    // Migrate from old path to new path
+    try {
+      const oldCfg = readFileSync(OLD_USER_CONFIG, "utf-8");
+      mkdirSync(join(USER_CONFIG, ".."), { recursive: true });
+      writeFileSync(USER_CONFIG, oldCfg, "utf-8");
+      console.error("[pi-fuse] Migrated config from", OLD_USER_CONFIG, "to", USER_CONFIG);
+    } catch {}
   }
-
-  return validatePresets(bundled);
-}
-
-// ── Jitter helper ──────────────────────────────────────────────────────────
-
-function jitterMs(min = 0, max = 500) {
-  return Math.floor(Math.random() * (max - min + 1)) + min;
+  if (!existsSync(USER_CONFIG)) {
+    // First run — copy bundled defaults so user has something to edit
+    try {
+      mkdirSync(join(USER_CONFIG, ".."), { recursive: true });
+      writeFileSync(USER_CONFIG, JSON.stringify(bundled, null, 2), "utf-8");
+      console.error("[pi-fuse] Created user config at", USER_CONFIG);
+    } catch {}
+  }
+  const user = tryLoad<FuseConfig>(USER_CONFIG);
+  if (user) {
+    return {
+      default_preset: user.default_preset || bundled.default_preset,
+      presets: { ...bundled.presets, ...user.presets },
+    };
+  }
+  return bundled;
 }
 
 // ── Token estimation / context truncation ─────────────────────────────────
-// Rough: ~3.5 chars per token. Over-estimates for code, fine for truncation.
 function estimateTokens(text: string): number {
   return Math.ceil(text.length / 3.5);
 }
@@ -228,100 +146,51 @@ function estimateTokens(text: string): number {
 function truncateMessages(
   msgs: { role: string; content: string }[],
   maxTokens: number
-): { messages: { role: string; content: string }[]; truncated: { droppedHistory: number; trimmedMessage: boolean } } {
-  const result: { droppedHistory: number; trimmedMessage: boolean } = {
-    droppedHistory: 0,
-    trimmedMessage: false,
-  };
-
-  // Panel models only need the question — no system prompt (it's just skill
-  // instructions for the main agent, irrelevant to panel models). Keep as
-  // many recent messages as fit in the context window.
+): { messages: { role: string; content: string }[] } {
   const lastUser = [...msgs].reverse().find((m) => m.role === "user");
-  if (!lastUser) return { messages: msgs.slice(-1), truncated: result };
+  if (!lastUser) return { messages: msgs.slice(-1) };
 
-  let tokenBudget = maxTokens - 512; // reserve for JSON overhead + output headroom
-  if (tokenBudget <= 0) tokenBudget = 256;
-
-  // Walk backwards from the end, collect messages newest-first
+  let budget = Math.max(256, maxTokens - 512);
   const reversed = [...msgs].reverse();
   const collected: { role: string; content: string }[] = [];
-  let origCount = 0;
+
   for (const m of reversed) {
     if (m.role === "system") continue;
-    origCount++;
     const t = estimateTokens(m.content);
-    if (t <= tokenBudget) {
-      collected.push(m);
-      tokenBudget -= t;
-    } else if (m === lastUser || collected.length === 0) {
-      // Always include the user message — trim it as last resort
-      const trimmed = m.content.slice(0, Math.max(50, Math.floor(tokenBudget * 3.5)));
-      collected.push({ ...m, content: trimmed });
-      result.trimmedMessage = true;
+    if (t <= budget) { collected.push(m); budget -= t; }
+    else if (m === lastUser || collected.length === 0) {
+      collected.push({ ...m, content: m.content.slice(0, Math.max(50, Math.floor(budget * 3.5))) });
       break;
     }
-
   }
 
-  result.droppedHistory = origCount - collected.length;
-  // Reverse back to chronological order
-  return { messages: collected.reverse(), truncated: result };
+  return { messages: collected.reverse() };
 }
 
 // ── Circuit breaker ─────────────────────────────────────────────────────────
-// Per-provider failure tracking: after N consecutive failures, skip the
-// provider for M seconds. Resets on success.
+// After 3 consecutive failed prompts for a provider, skip for 30s.
+// recordFailure only fires after all 429 retries are exhausted, so
+// transient rate limits that recover never trip this.
 
-interface CircuitState {
-  failures: number;
-  openedAt: number; // 0 = circuit closed
-}
+const circuitState = new Map<string, { failures: number; openedAt: number }>();
 
-const CIRCUIT_THRESHOLD = 3;       // Consecutive failures before opening
-const CIRCUIT_COOLDOWN_MS = 30_000; // Milliseconds before retrying an open circuit
-
-// Module-level state persists across all fusion calls
-const circuitBreakers = new Map<string, CircuitState>();
-
-function recordSuccess(provider: string): void {
-  const state = circuitBreakers.get(provider);
-  if (state) {
-    state.failures = 0;
-    state.openedAt = 0;
-  }
-}
-
-function recordFailure(provider: string): void {
-  let state = circuitBreakers.get(provider);
-  if (!state) {
-    state = { failures: 0, openedAt: 0 };
-    circuitBreakers.set(provider, state);
-  }
-  state.failures++;
-  if (state.failures >= CIRCUIT_THRESHOLD) {
-    state.openedAt = Date.now();
-    console.error(`[pi-fuse] Circuit opened for "${provider}" — ${state.failures} consecutive failures`);
-  }
+function recordFailure(provider: string) {
+  let s = circuitState.get(provider);
+  if (!s) { s = { failures: 0, openedAt: 0 }; circuitState.set(provider, s); }
+  s.failures++;
+  if (s.failures >= 3) { s.openedAt = Date.now(); console.error(`[pi-fuse] Circuit open for ${provider}`); }
 }
 
 function isCircuitOpen(provider: string): boolean {
-  const state = circuitBreakers.get(provider);
-  if (!state || state.openedAt === 0) return false;
-  if (Date.now() - state.openedAt > CIRCUIT_COOLDOWN_MS) {
-    // Cooldown expired — close circuit (half-open), allow one request
-    state.failures = 0;
-    state.openedAt = 0;
-    console.error(`[pi-fuse] Circuit closing for "${provider}" — cooldown expired`);
-    return false;
-  }
+  const s = circuitState.get(provider);
+  if (!s || s.openedAt === 0) return false;
+  if (Date.now() - s.openedAt > 30000) { s.failures = 0; s.openedAt = 0; return false; }
   return true;
 }
 
 // ── Extension entry point ──────────────────────────────────────────────────
 
 export default async function (pi: ExtensionAPI) {
-  // Load config (bundled defaults + optional user override)
   const fuseConfig = loadConfig();
   const PRESET_NAMES = Object.keys(fuseConfig.presets);
 
@@ -330,9 +199,6 @@ export default async function (pi: ExtensionAPI) {
     return;
   }
 
-  // Dynamic: re-read auth/models at request time so credential changes
-  // are picked up without /reload. The cache is a simple module-level
-  // ref that gets refreshed per fusion.
   let authCache: Record<string, AuthEntry> = loadAuth();
   let modelsCache: ModelsFile = loadModels();
 
@@ -344,23 +210,21 @@ export default async function (pi: ExtensionAPI) {
     const model = ref.slice(colon + 1);
     const provDef = modelsCache.providers?.[provider];
     if (!provDef)
-      throw new Error(
-        `Unknown provider "${provider}". Valid: ${Object.keys(modelsCache.providers || {}).join(", ")}`
-      );
+      throw new Error(`Unknown provider "${provider}". Valid: ${Object.keys(modelsCache.providers || {}).join(", ")}`);
     const apiKey =
       authCache[provider]?.key ||
-      authCache[provDef.apiKey] ||
       process.env[provDef.apiKey.replace(/^\$/, "")] ||
       provDef.apiKey;
     if (!apiKey)
       throw new Error(`No API key for "${provider}". Add to auth.json as {"${provider}":{"key":"sk-..."}} or set ${provDef.apiKey.replace(/^\$/, "")} env var.`);
-    // Look up the model's contextWindow from provider model list
     const modDef = (provDef as any).models?.find((m: any) => m.id === model);
-    const contextWindow = modDef?.contextWindow ?? undefined;
-    return { provider, model, baseUrl: provDef.baseUrl, apiKey, contextWindow };
+    return {
+      provider, model, baseUrl: provDef.baseUrl, apiKey,
+      contextWindow: modDef?.contextWindow ?? undefined,
+      maxInput: modDef?.maxInput ?? undefined,
+    };
   }
 
-  // ── Refresh auth/models from disk ─────────────────────────────────────
   function refreshConfigs() {
     const fresh = loadAuth();
     if (Object.keys(fresh).length > 0) authCache = fresh;
@@ -373,14 +237,8 @@ export default async function (pi: ExtensionAPI) {
     entry: ResolvedEndpoint,
     messages: { role: string; content: string }[],
     signal?: AbortSignal,
-    attempt = 1,
-    onRetry?: (attempt: number) => void
-  ): Promise<{ content: string; usage?: { input: number; output: number } }> {
-    const headers: Record<string, string> = {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${entry.apiKey}`,
-    };
-
+    attempt = 1
+  ): Promise<{ content: string }> {
     const controller = new AbortController();
     const mergedSignal = signal ?? controller.signal;
     const timeout = setTimeout(() => controller.abort(), 45000);
@@ -388,7 +246,10 @@ export default async function (pi: ExtensionAPI) {
     try {
       const res = await fetch(`${entry.baseUrl}/chat/completions`, {
         method: "POST",
-        headers,
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${entry.apiKey}`,
+        },
         body: JSON.stringify({
           model: entry.model,
           messages,
@@ -400,10 +261,9 @@ export default async function (pi: ExtensionAPI) {
       });
 
       if (res.status === 429 && attempt < 3) {
-        onRetry?.(attempt + 1);
-        const backoff = Math.min(1000 * 2 ** attempt + jitterMs(0, 500), 5000);
+        const backoff = Math.min(1000 * 2 ** attempt + Math.floor(Math.random() * 500), 5000);
         await new Promise((r) => setTimeout(r, backoff));
-        return callPanelModel(entry, messages, signal, attempt + 1, onRetry);
+        return callPanelModel(entry, messages, signal, attempt + 1);
       }
 
       if (!res.ok) {
@@ -413,16 +273,9 @@ export default async function (pi: ExtensionAPI) {
 
       const data = (await res.json()) as {
         choices: { message: { content: string } }[];
-        usage?: { prompt_tokens: number; completion_tokens: number };
       };
 
-      recordSuccess(entry.provider);
-      return {
-        content: data.choices?.[0]?.message?.content ?? "[no output]",
-        usage: data.usage
-          ? { input: data.usage.prompt_tokens, output: data.usage.completion_tokens }
-          : undefined,
-      };
+      return { content: data.choices?.[0]?.message?.content ?? "[no output]" };
     } finally {
       clearTimeout(timeout);
     }
@@ -436,14 +289,12 @@ export default async function (pi: ExtensionAPI) {
     output: AssistantMessage,
     stream: AssistantMessageEventStream
   ): Promise<void> {
-    const headers: Record<string, string> = {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${entry.apiKey}`,
-    };
-
     const res = await fetch(`${entry.baseUrl}/chat/completions`, {
       method: "POST",
-      headers,
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${entry.apiKey}`,
+      },
       body: JSON.stringify({
         model: entry.model,
         messages,
@@ -483,7 +334,6 @@ export default async function (pi: ExtensionAPI) {
         const trimmed = line.trim();
         if (!trimmed || !trimmed.startsWith("data: ")) continue;
         const payload = trimmed.slice(6);
-
         if (payload === "[DONE]") break;
 
         try {
@@ -500,16 +350,11 @@ export default async function (pi: ExtensionAPI) {
           const delta = chunk.choices?.[0]?.delta?.content;
           if (delta) {
             const block = output.content[1];
-            if (block.type === "text") {
-              block.text += delta;
-            }
+            if (block.type === "text") block.text += delta;
             stream.push({ type: "text_delta", contentIndex: 1, delta, partial: output });
           }
         } catch {
-          // Malformed SSE line — skip. Log truncated line for debugging.
-          if (trimmed.length < 200) {
-            console.debug("[pi-fuse] SSE parse skip:", trimmed.slice(0, 100));
-          }
+          if (trimmed.length < 200) console.debug("[pi-fuse] SSE parse skip:", trimmed.slice(0, 100));
         }
       }
     }
@@ -517,8 +362,6 @@ export default async function (pi: ExtensionAPI) {
     output.usage.input = judgeInputTokens;
     output.usage.output = judgeOutputTokens;
     output.usage.totalTokens = judgeInputTokens + judgeOutputTokens;
-    // Manually zero cost — panel/judge providers are free-tier or negligible.
-    // calculateCost() would need a Model object, not an AssistantMessage.
     output.usage.cost = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 };
 
     stream.push({ type: "text_end", contentIndex: 1, content: output.content[1]?.text ?? "", partial: output });
@@ -533,10 +376,7 @@ export default async function (pi: ExtensionAPI) {
       api: FUSE_API,
       provider: "fuse",
       model: "fuse-unknown",
-      usage: {
-        input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
-        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-      },
+      usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
       stopReason: "error",
       errorMessage,
       timestamp: Date.now(),
@@ -562,49 +402,33 @@ export default async function (pi: ExtensionAPI) {
         api: FUSE_API,
         provider: "fuse",
         model: `fuse-${presetName}`,
-        usage: {
-          input: 0,
-          output: 0,
-          cacheRead: 0,
-          cacheWrite: 0,
-          totalTokens: 0,
-          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-        },
+        usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
         stopReason: "stop",
         timestamp: Date.now(),
       };
 
       try {
-        // Refresh auth/models each fusion so cred changes take effect
         refreshConfigs();
 
         const preset = fuseConfig.presets[presetName];
         if (!preset) throw new Error(`Unknown fuse preset "${presetName}"`);
-
         const panelEntries = preset.panel.map(resolveModel);
         const judgeEntry = resolveModel(preset.judge);
-        // Circuit breaker: fail fast if judge provider circuit is open
+
         if (isCircuitOpen(judgeEntry.provider)) {
-          throw new Error(
-            `Judge circuit open for "${judgeEntry.provider}" — ${CIRCUIT_THRESHOLD} consecutive failures, cooling down for ${CIRCUIT_COOLDOWN_MS / 1000}s`
-          );
+          throw new Error(`Judge circuit open for "${judgeEntry.provider}" — cooling down`);
         }
 
         // ── Thinking block for live progress ────────────────────────
         const presetLabel = presetName.charAt(0).toUpperCase() + presetName.slice(1);
         const thinkingHeader = `Fuse ${presetLabel} — ${panelEntries.length} panel + judge\n\n`;
-        output.content.push({
-          type: "thinking",
-          thinking: thinkingHeader,
-        } as ThinkingContent);
+        output.content.push({ type: "thinking", thinking: thinkingHeader } as ThinkingContent);
         stream.push({ type: "start", partial: output });
         stream.push({ type: "thinking_start", contentIndex: 0, partial: output });
 
         function thinkPush(text: string) {
           const block = output.content[0];
-          if (block.type === "thinking") {
-            block.thinking += text;
-          }
+          if (block.type === "thinking") block.thinking += text;
           stream.push({ type: "thinking_delta", contentIndex: 0, delta: text, partial: output });
         }
 
@@ -619,72 +443,38 @@ export default async function (pi: ExtensionAPI) {
 
         for (const msg of context.messages ?? []) {
           if (!("role" in msg) || !("content" in msg)) continue;
-
-          const role = (msg as { role: string }).role as string;
+          const role = (msg as { role: string }).role;
           const content = (msg as { content: unknown }).content;
 
-          if (role === "tool" || role === "tool_result") continue;
-
-          if (role === "assistant") {
-            if (typeof content === "string") {
-              contextMessages.push({ role: "assistant", content });
-            }
-            continue;
-          }
+          // Panel models only accept standard roles: system, user, assistant, tool
+          if (!["system", "user", "assistant", "tool"].includes(role)) continue;
+          if (role === "tool") continue;
 
           let text = "";
-          if (typeof content === "string") {
-            text = content;
-          } else if (Array.isArray(content)) {
-            text = content
-              .map((part: { type?: string; text?: string }) =>
-                part.type === "text" ? (part.text ?? "") : ""
-              )
-              .filter(Boolean)
-              .join("\n");
-          }
+          if (typeof content === "string") text = content;
+          else if (Array.isArray(content))
+            text = content.filter((p: any) => p.type === "text").map((p: any) => p.text ?? "").join("\n");
 
-          if (text) {
-            contextMessages.push({ role, content: text });
-          }
+          if (text) contextMessages.push({ role, content: text });
         }
 
-        if (contextMessages.length === 0) {
-          contextMessages.push({ role: "user", content: "..." });
-        }
+        if (contextMessages.length === 0) contextMessages.push({ role: "user", content: "..." });
 
-        // ── Fan-out to panel models with live status ────────────────
+        // ── Fan-out to panel models ────────────────────────────────
         const panelResults = await Promise.all(
           panelEntries.map(async (entry, idx) => {
-            if (idx > 0) await new Promise((r) => setTimeout(r, jitterMs(50, 300)));
+            if (idx > 0) await new Promise((r) => setTimeout(r, Math.floor(Math.random() * 250) + 50));
             const shortName = entry.model.split("/").pop()!;
-            // Circuit breaker: skip if provider has too many consecutive failures
             if (isCircuitOpen(entry.provider)) {
-              thinkPush(`  ⊘ ${entry.provider}:${shortName} — circuit open (${CIRCUIT_THRESHOLD}+ failures)\n`);
-              return {
-                label: `${entry.provider}:${entry.model}`,
-                content: null,
-                error: `Circuit open for ${entry.provider} — skipping after ${CIRCUIT_THRESHOLD} consecutive failures`,
-              };
+              thinkPush(`  ⊘ ${entry.provider}:${shortName} — circuit open\n`);
+              return { label: `${entry.provider}:${entry.model}`, content: null, error: 'circuit open' };
             }
             const t0 = performance.now();
             try {
-              // Truncate context to fit this model's limits
               const ctxWindow = entry.contextWindow ?? 128000;
-              const maxInput = ctxWindow - 4096;
-              const { messages: panelMsgs, truncated } = truncateMessages(contextMessages, maxInput);
-              if (truncated.droppedHistory > 0 || truncated.trimmedMessage) {
-                thinkPush(`  ⚠ ${entry.provider}:${shortName} — context trimmed (${truncated.droppedHistory} msgs dropped${truncated.trimmedMessage ? ', msg truncated' : ''})\n`);
-              }
-              const result = await callPanelModel(
-                entry,
-                panelMsgs,
-                signal,
-                1,
-                (attempt) => {
-                  thinkPush(`  ⟳ ${entry.provider}:${shortName} — Retrying… (${attempt}/3)\n`);
-                }
-              );
+              const budget = entry.maxInput != null ? Math.min(entry.maxInput, ctxWindow - 4096) : ctxWindow - 4096;
+              const { messages: panelMsgs } = truncateMessages(contextMessages, budget);
+              const result = await callPanelModel(entry, panelMsgs, signal);
               const elapsed = ((performance.now() - t0) / 1000).toFixed(1);
               thinkPush(`  ✓ ${entry.provider}:${shortName} ${elapsed}s\n`);
               return { label: `${entry.provider}:${entry.model}`, content: result.content };
@@ -693,31 +483,20 @@ export default async function (pi: ExtensionAPI) {
               const elapsed = ((performance.now() - t0) / 1000).toFixed(1);
               const errMsg = (err as Error).message.slice(0, 80);
               thinkPush(`  ✗ ${entry.provider}:${shortName} ${elapsed}s — ${errMsg}\n`);
-              return {
-                label: `${entry.provider}:${entry.model}`,
-                content: null,
-                error: (err as Error).message,
-              };
+              return { label: `${entry.provider}:${entry.model}`, content: null, error: (err as Error).message };
             }
           })
         );
 
         const succeeded = panelResults.filter((r) => r.content !== null);
-        if (succeeded.length === 0) throw new Error("All panel models failed");
-
-        const panelInputTokens = succeeded.reduce((sum) => sum + 100, 0);
-        const panelOutputTokens = succeeded.reduce(
-          (sum, r) => sum + (r.content?.split(" ").length ?? 0) * 1.3,
-          0
-        );
-        output.usage.input += panelInputTokens;
-        output.usage.output += panelOutputTokens;
+        if (succeeded.length === 0) {
+          const errors = panelResults.map((r) => r.error).filter(Boolean).join("; ");
+          throw new Error(`All panel models failed: ${errors}`);
+        }
 
         // ── Build judge prompt ────────────────────────────────────────
         const originalQ = contextMessages.findLast((m) => m.role === "user")?.content ?? "";
-        const sections = succeeded.map(
-          (r, i) => `--- Model ${i + 1} (${r.label}) ---\n\n${r.content}`
-        );
+        const sections = succeeded.map((r, i) => `--- Model ${i + 1} (${r.label}) ---\n\n${r.content}`);
 
         const judgeShortName = judgeEntry.model.split("/").pop()!;
         thinkPush(`\n→ Synthesizing with ${judgeEntry.provider}:${judgeShortName}...\n\n`);
@@ -747,11 +526,7 @@ export default async function (pi: ExtensionAPI) {
         // ── Stream judge response ─────────────────────────────────────
         await streamJudge(judgeEntry, judgeMessages, signal, output, stream);
 
-        stream.push({
-          type: "done",
-          reason: output.stopReason as "stop" | "length" | "toolUse",
-          message: output,
-        });
+        stream.push({ type: "done", reason: output.stopReason as "stop" | "length" | "toolUse", message: output });
         stream.end();
       } catch (err) {
         console.error(`[pi-fuse] Fusion error:`, (err as Error)?.message ?? err);
@@ -766,19 +541,28 @@ export default async function (pi: ExtensionAPI) {
   }
 
   // ── Build model list from presets ─────────────────────────────────────
-  const models = PRESET_NAMES.map((name) => ({
-    id: `fuse-${name}`,
-    name: `Fuse ${name.charAt(0).toUpperCase() + name.slice(1)}`,
-    reasoning: false,
-    input: ["text"] as ("text" | "image")[],
-    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-    contextWindow: 128000,
-    maxTokens: 4096,
-    compat: {
-      supportsDeveloperRole: false,
-      supportsReasoningEffort: false,
-    },
-  }));
+  // contextWindow is the minimum of all panel + judge models, since
+  // each panel model's input gets truncated to its own limit.
+  function getCtx(ref: string): number {
+    const [prov, ...rest] = ref.split(":");
+    const modelId = rest.join(":");
+    const mod = (modelsCache.providers?.[prov] as any)?.models?.find((m: any) => m.id === modelId);
+    return mod?.contextWindow ?? 128000;
+  }
+  const models = PRESET_NAMES.map((name) => {
+    const p = fuseConfig.presets[name];
+    const ctx = Math.min(...[...p.panel, p.judge].map(getCtx));
+    return {
+      id: `fuse-${name}`,
+      name: `Fuse ${name.charAt(0).toUpperCase() + name.slice(1)}`,
+      reasoning: false,
+      input: ["text"] as ("text" | "image")[],
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+      contextWindow: ctx,
+      maxTokens: 4096,
+      compat: { supportsDeveloperRole: false, supportsReasoningEffort: false },
+    };
+  });
 
   const FUSE_API = "fuse" as Api;
 
@@ -791,17 +575,31 @@ export default async function (pi: ExtensionAPI) {
     models,
 
     streamSimple: (model: Model<typeof FUSE_API>, context: Context, options?: SimpleStreamOptions) => {
-      // Defensive: only handle fuse-* model IDs. If Pi misroutes a non-fuse
-      // model here, return an immediate error stream instead of crashing.
       if (!model.id.startsWith("fuse-") || !fuseConfig.presets[model.id.slice(5)]) {
         return createErrorStream(`fuse: "${model.id}" is not a registered fuse preset`);
       }
-      const presetName = model.id.replace(/^fuse-/, "");
-      return createFuseStream(presetName, context, options);
+      return createFuseStream(model.id.replace(/^fuse-/, ""), context, options);
     },
   });
 
-  console.error(
-    `[pi-fuse] Registered ${models.length} fuse model(s): ${models.map((m) => m.id).join(", ")}`
-  );
+  // ── Show preset config in status bar when fuse model is selected ──
+  function shortModelName(ref: string): string {
+    const model = ref.slice(ref.indexOf(":") + 1);
+    const short = model.split("/").pop() || model;
+    return short.replace(/:free$/, "");
+  }
+  pi.on("model_select", async (event, ctx) => {
+    if (event.previousModel?.id.startsWith("fuse-")) {
+      ctx.ui.setStatus("fuse", undefined);
+    }
+    if (!event.model.id.startsWith("fuse-")) return;
+    const presetName = event.model.id.replace(/^fuse-/, "");
+    const preset = fuseConfig.presets[presetName];
+    if (!preset) return;
+    const panel = preset.panel.map((r) => shortModelName(r)).join(" · ");
+    const judge = shortModelName(preset.judge);
+    ctx.ui.setStatus("fuse", `FUSE: ⚖️ ${judge}  👥 ${panel}`);
+  });
+
+  console.error(`[pi-fuse] Registered ${models.length} fuse model(s): ${models.map((m) => m.id).join(", ")}`);
 }
