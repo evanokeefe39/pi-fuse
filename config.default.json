@@ -2,7 +2,7 @@
   "default_preset": "fast",
   "presets": {
     "fast": {
-      "panel": ["deepseek:deepseek-v4-flash", "groq:llama-3.1-8b-instant"],
+      "panel": ["deepseek:deepseek-v4-flash", "groq:llama-3.3-70b-versatile"],
       "judge": "deepseek:deepseek-v4-flash"
     },
     "deep": {
